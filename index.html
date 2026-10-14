@@ -6,18 +6,20 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Coin Rush</title>
 
+  <!-- PeerJS for multiplayer connections -->
   <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
 
+  <!-- ==================== STYLES ==================== -->
   <style>
     body {
       margin: 0;
+      padding: 16px;
       background: #12141c;
       color: #fff;
       font-family: system-ui, sans-serif;
       display: flex;
       flex-direction: column;
       align-items: center;
-      padding: 16px;
     }
 
     h1 {
@@ -33,10 +35,11 @@
       margin-bottom: 10px;
     }
 
-    input, button {
+    input,
+    button {
       padding: 10px 14px;
-      border-radius: 8px;
       border: 0;
+      border-radius: 8px;
       font-size: 16px;
     }
 
@@ -59,10 +62,16 @@
       background: #ffe07d;
     }
 
+    button:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+
     #status {
       margin: 6px 0;
       min-height: 22px;
       color: #9fb3ff;
+      text-align: center;
     }
 
     canvas {
@@ -70,24 +79,749 @@
       border: 3px solid #2e3550;
       border-radius: 10px;
       max-width: 100%;
+      height: auto;
     }
   </style>
 </head>
 
 <body>
+  <!-- ==================== USER INTERFACE ==================== -->
   <h1>🪙 Coin Rush</h1>
 
   <div id="menu">
-    <input id="name" placeholder="Your name" maxlength="12">
+    <input
+      id="name"
+      type="text"
+      placeholder="Your name"
+      maxlength="12"
+      aria-label="Your name"
+    >
+
     <button id="hostBtn">Host game</button>
-    <input id="code" placeholder="Room code" maxlength="4">
+
+    <input
+      id="code"
+      type="text"
+      placeholder="Room code"
+      maxlength="4"
+      aria-label="Room code"
+    >
+
     <button id="joinBtn">Join</button>
   </div>
 
-  <div id="status">
+  <div id="status" role="status">
     Host a game or join with a room code.
   </div>
 
   <canvas id="c" width="800" height="500"></canvas>
 
+  <!-- ==================== GAME LOGIC ==================== -->
   <script>
+    // --------------------------------------------------
+    // 1. GAME CONFIGURATION
+    // --------------------------------------------------
+
+    const W = 800;
+    const H = 500;
+    const R = 14;
+    const SPEED = 240;
+    const ROUND_TIME = 60;
+    const COIN_COUNT = 6;
+    const MAX_PLAYERS = 6;
+    const BROADCAST_INTERVAL = 33;
+
+    const COLORS = [
+      '#ff5c5c',
+      '#4ecbff',
+      '#7dff6a',
+      '#d98bff',
+      '#ffa94d',
+      '#ff7ad9'
+    ];
+
+    // --------------------------------------------------
+    // 2. DOM ELEMENTS AND CANVAS
+    // --------------------------------------------------
+
+    const canvas = document.getElementById('c');
+    const ctx = canvas.getContext('2d');
+    const statusEl = document.getElementById('status');
+
+    const nameInput = document.getElementById('name');
+    const codeInput = document.getElementById('code');
+    const hostBtn = document.getElementById('hostBtn');
+    const joinBtn = document.getElementById('joinBtn');
+    const menu = document.getElementById('menu');
+
+    // --------------------------------------------------
+    // 3. MULTIPLAYER VARIABLES
+    // --------------------------------------------------
+
+    let peer = null;
+    let isHost = false;
+    let myId = null;
+    let roomCode = '';
+
+    let hostConn = null;
+
+    const guestConns = {};
+    const inputs = {};
+
+    // --------------------------------------------------
+    // 4. SHARED GAME STATE
+    // --------------------------------------------------
+
+    let state = {
+      players: {},
+      coins: [],
+      time: ROUND_TIME,
+      phase: 'wait',
+      msg: ''
+    };
+
+    let last = performance.now();
+    let overTimer = 0;
+    let hostTickWorker = null;
+    let hostTickTimer = null;
+    let renderFrame = null;
+    let inputTimer = null;
+
+    // --------------------------------------------------
+    // 5. KEYBOARD INPUT
+    // --------------------------------------------------
+
+    const keys = {};
+
+    window.addEventListener('keydown', event => {
+      keys[event.key.toLowerCase()] = true;
+
+      if (event.key.startsWith('Arrow')) {
+        event.preventDefault();
+      }
+    });
+
+    window.addEventListener('keyup', event => {
+      keys[event.key.toLowerCase()] = false;
+    });
+
+    window.addEventListener('blur', () => {
+      for (const key in keys) {
+        keys[key] = false;
+      }
+    });
+
+    function readInput() {
+      const dx =
+        (keys['d'] || keys['arrowright'] ? 1 : 0) -
+        (keys['a'] || keys['arrowleft'] ? 1 : 0);
+
+      const dy =
+        (keys['s'] || keys['arrowdown'] ? 1 : 0) -
+        (keys['w'] || keys['arrowup'] ? 1 : 0);
+
+      return { dx, dy };
+    }
+
+    // --------------------------------------------------
+    // 6. HELPER FUNCTIONS
+    // --------------------------------------------------
+
+    const rand = (min, max) =>
+      min + Math.random() * (max - min);
+
+    function newCoin() {
+      return {
+        x: rand(30, W - 30),
+        y: rand(30, H - 30)
+      };
+    }
+
+    function colorFor() {
+      return COLORS[
+        Object.keys(state.players).length % COLORS.length
+      ];
+    }
+
+    function addPlayer(id, name) {
+      state.players[id] = {
+        x: rand(50, W - 50),
+        y: rand(50, H - 50),
+        score: 0,
+        name: String(name || 'Player').slice(0, 12),
+        color: colorFor()
+      };
+
+      inputs[id] = { dx: 0, dy: 0 };
+    }
+
+    function setStatus(message) {
+      statusEl.textContent = message;
+    }
+
+    function lockMenu() {
+      menu.style.display = 'none';
+    }
+
+    function unlockMenu() {
+      menu.style.display = 'flex';
+    }
+
+    function stopLoops() {
+      if (hostTickWorker) {
+        hostTickWorker.terminate();
+        hostTickWorker = null;
+      }
+
+      if (hostTickTimer) {
+        clearInterval(hostTickTimer);
+        hostTickTimer = null;
+      }
+
+      if (inputTimer) {
+        clearInterval(inputTimer);
+        inputTimer = null;
+      }
+
+      if (renderFrame !== null) {
+        cancelAnimationFrame(renderFrame);
+        renderFrame = null;
+      }
+    }
+
+    function resetConnection() {
+      stopLoops();
+
+      if (peer) {
+        peer.destroy();
+        peer = null;
+      }
+
+      hostConn = null;
+      isHost = false;
+      myId = null;
+      roomCode = '';
+
+      for (const id in guestConns) {
+        delete guestConns[id];
+      }
+
+      for (const id in inputs) {
+        delete inputs[id];
+      }
+
+      state = {
+        players: {},
+        coins: [],
+        time: ROUND_TIME,
+        phase: 'wait',
+        msg: ''
+      };
+
+      last = performance.now();
+      overTimer = 0;
+      unlockMenu();
+      render();
+    }
+
+    // --------------------------------------------------
+    // 7. HOSTING A GAME
+    // --------------------------------------------------
+
+    function hostGame() {
+      if (peer) return;
+
+      const name = nameInput.value.trim() || 'Host';
+
+      hostBtn.disabled = true;
+      joinBtn.disabled = true;
+      setStatus('Creating room...');
+
+      createHostPeer(name);
+    }
+
+    function createHostPeer(name) {
+      roomCode = Array.from(
+        { length: 4 },
+        () => 'ABCDEFGHJKLMNPQRSTUVWXYZ'[
+          Math.floor(Math.random() * 24)
+        ]
+      ).join('');
+
+      peer = new Peer('coinrush-' + roomCode);
+
+      peer.on('error', error => {
+        if (error.type === 'unavailable-id') {
+          peer.destroy();
+          peer = null;
+          createHostPeer(name);
+          return;
+        }
+
+        setStatus('Connection error: ' + error.type);
+        hostBtn.disabled = false;
+        joinBtn.disabled = false;
+      });
+
+      peer.on('open', () => {
+        isHost = true;
+        myId = 'host';
+
+        addPlayer('host', name);
+
+        state.coins = Array.from(
+          { length: COIN_COUNT },
+          () => newCoin()
+        );
+
+        state.phase = 'play';
+        state.time = ROUND_TIME;
+
+        lockMenu();
+
+        setStatus(
+          'Room code: ' + roomCode +
+          ' — share it with friends! Keep this tab open.'
+        );
+
+        last = performance.now();
+        startHostTick();
+        startRendering();
+      });
+
+      peer.on('connection', conn => {
+        guestConns[conn.peer] = conn;
+
+        conn.on('data', data => {
+          if (data.t === 'join') {
+            if (state.players[conn.peer]) return;
+
+            if (
+              Object.keys(state.players).length >= MAX_PLAYERS
+            ) {
+              conn.send({ t: 'full' });
+              conn.close();
+              return;
+            }
+
+            addPlayer(conn.peer, data.name);
+          }
+
+          if (
+            data.t === 'input' &&
+            inputs[conn.peer]
+          ) {
+            inputs[conn.peer] = {
+              dx: Math.sign(data.dx) || 0,
+              dy: Math.sign(data.dy) || 0
+            };
+          }
+        });
+
+        conn.on('close', () => {
+          delete guestConns[conn.peer];
+          delete state.players[conn.peer];
+          delete inputs[conn.peer];
+        });
+      });
+    }
+
+    // --------------------------------------------------
+    // 8. HOST GAME LOOP AND ROUND MANAGEMENT
+    // --------------------------------------------------
+
+    function startHostTick() {
+      const workerCode = `
+        setInterval(() => postMessage(0), ${BROADCAST_INTERVAL});
+      `;
+
+      try {
+        const blob = new Blob(
+          [workerCode],
+          { type: 'text/javascript' }
+        );
+
+        const workerURL = URL.createObjectURL(blob);
+        hostTickWorker = new Worker(workerURL);
+
+        hostTickWorker.onmessage = () => {
+          hostTick(performance.now());
+        };
+
+        hostTickWorker.onerror = () => {
+          hostTickWorker.terminate();
+          hostTickWorker = null;
+
+          hostTickTimer = setInterval(() => {
+            hostTick(performance.now());
+          }, BROADCAST_INTERVAL);
+        };
+
+        // Release the temporary URL after the worker loads.
+        hostTickWorker.onmessage = () => {
+          if (hostTickWorker && !hostTickWorker.started) {
+            hostTickWorker.started = true;
+            URL.revokeObjectURL(workerURL);
+          }
+
+          hostTick(performance.now());
+        };
+      } catch (error) {
+        hostTickTimer = setInterval(() => {
+          hostTick(performance.now());
+        }, BROADCAST_INTERVAL);
+      }
+    }
+
+    function hostTick(now) {
+      const dt = Math.min((now - last) / 1000, 0.25);
+      last = now;
+
+      inputs.host = readInput();
+
+      if (state.phase === 'play') {
+        updatePlayers(dt);
+        updateRound(dt);
+      } else if (state.phase === 'over') {
+        overTimer -= dt;
+
+        if (overTimer <= 0) {
+          startNewRound();
+        }
+      }
+
+      broadcast();
+    }
+
+    function updatePlayers(dt) {
+      for (const id in state.players) {
+        const player = state.players[id];
+        const input = inputs[id] || { dx: 0, dy: 0 };
+
+        let { dx, dy } = input;
+
+        if (dx && dy) {
+          dx *= Math.SQRT1_2;
+          dy *= Math.SQRT1_2;
+        }
+
+        player.x = Math.max(
+          R,
+          Math.min(W - R, player.x + dx * SPEED * dt)
+        );
+
+        player.y = Math.max(
+          R,
+          Math.min(H - R, player.y + dy * SPEED * dt)
+        );
+
+        collectCoins(player);
+      }
+    }
+
+    function collectCoins(player) {
+      for (let i = 0; i < state.coins.length; i++) {
+        const coin = state.coins[i];
+
+        if (
+          Math.hypot(
+            player.x - coin.x,
+            player.y - coin.y
+          ) < R + 10
+        ) {
+          player.score++;
+          state.coins[i] = newCoin();
+        }
+      }
+    }
+
+    function updateRound(dt) {
+      state.time -= dt;
+
+      if (state.time <= 0) {
+        state.time = 0;
+        state.phase = 'over';
+        overTimer = 5;
+
+        const sorted = Object.values(state.players).sort(
+          (a, b) => b.score - a.score
+        );
+
+        state.msg = sorted.length
+          ? '🏆 ' + sorted[0].name +
+            ' wins with ' + sorted[0].score + ' coins!'
+          : '';
+      }
+    }
+
+    function startNewRound() {
+      for (const id in state.players) {
+        state.players[id].score = 0;
+      }
+
+      state.coins = Array.from(
+        { length: COIN_COUNT },
+        () => newCoin()
+      );
+
+      state.time = ROUND_TIME;
+      state.phase = 'play';
+      state.msg = '';
+    }
+
+    // --------------------------------------------------
+    // 9. SYNCHRONIZE GAME STATE
+    // --------------------------------------------------
+
+    function broadcast() {
+      const message = {
+        t: 'state',
+        s: state
+      };
+
+      for (const id in guestConns) {
+        const conn = guestConns[id];
+
+        if (conn.open) {
+          try {
+            conn.send(message);
+          } catch (error) {
+            console.error('Broadcast failed:', error);
+          }
+        }
+      }
+    }
+
+    // --------------------------------------------------
+    // 10. JOIN AN EXISTING GAME
+    // --------------------------------------------------
+
+    function joinGame() {
+      if (peer) return;
+
+      const name = nameInput.value.trim() || 'Guest';
+      const code = codeInput.value.trim().toUpperCase();
+
+      if (!/^[A-HJ-NP-Z]{4}$/.test(code)) {
+        setStatus('Enter a valid 4-letter room code.');
+        return;
+      }
+
+      hostBtn.disabled = true;
+      joinBtn.disabled = true;
+      setStatus('Connecting to room ' + code + '...');
+
+      peer = new Peer();
+
+      peer.on('error', error => {
+        setStatus(
+          'Connection error: ' + error.type +
+          '. Check the room code and host connection.'
+        );
+
+        hostBtn.disabled = false;
+        joinBtn.disabled = false;
+      });
+
+      peer.on('open', id => {
+        myId = id;
+
+        hostConn = peer.connect(
+          'coinrush-' + code,
+          { reliable: true }
+        );
+
+        hostConn.on('open', () => {
+          hostConn.send({
+            t: 'join',
+            name
+          });
+
+          lockMenu();
+          setStatus('Connected to room ' + code);
+
+          inputTimer = setInterval(
+            sendInput,
+            BROADCAST_INTERVAL
+          );
+
+          startRendering();
+        });
+
+        hostConn.on('data', data => {
+          if (data.t === 'state') {
+            state = data.s;
+          }
+
+          if (data.t === 'full') {
+            setStatus('This room is full.');
+            resetConnection();
+            hostBtn.disabled = false;
+            joinBtn.disabled = false;
+          }
+        });
+
+        hostConn.on('close', () => {
+          stopLoops();
+          setStatus('Host disconnected. Refresh to try again.');
+          unlockMenu();
+          hostBtn.disabled = false;
+          joinBtn.disabled = false;
+        });
+      });
+    }
+
+    function sendInput() {
+      if (!hostConn || !hostConn.open) return;
+
+      const input = readInput();
+
+      hostConn.send({
+        t: 'input',
+        dx: input.dx,
+        dy: input.dy
+      });
+    }
+
+    // --------------------------------------------------
+    // 11. RENDER PLAYERS, COINS, AND SCOREBOARD
+    // --------------------------------------------------
+
+    function render() {
+      ctx.clearRect(0, 0, W, H);
+
+      drawCoins();
+      drawPlayers();
+      drawScoreboard();
+      drawTimer();
+      drawWinner();
+    }
+
+    function drawCoins() {
+      const t = performance.now() / 200;
+
+      state.coins.forEach(coin => {
+        ctx.beginPath();
+
+        ctx.ellipse(
+          coin.x,
+          coin.y,
+          10 * Math.abs(Math.cos(t)) + 2,
+          10,
+          0,
+          0,
+          Math.PI * 2
+        );
+
+        ctx.fillStyle = '#ffd24a';
+        ctx.fill();
+
+        ctx.strokeStyle = '#b8860b';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      });
+    }
+
+    function drawPlayers() {
+      for (const id in state.players) {
+        const player = state.players[id];
+
+        ctx.beginPath();
+        ctx.arc(player.x, player.y, R, 0, Math.PI * 2);
+
+        ctx.fillStyle = player.color;
+        ctx.fill();
+
+        if (id === myId) {
+          ctx.strokeStyle = '#fff';
+          ctx.lineWidth = 3;
+          ctx.stroke();
+        }
+
+        ctx.fillStyle = '#fff';
+        ctx.font = '12px system-ui';
+        ctx.textAlign = 'center';
+
+        ctx.fillText(
+          player.name,
+          player.x,
+          player.y - R - 6
+        );
+      }
+    }
+
+    function drawScoreboard() {
+      ctx.textAlign = 'left';
+      ctx.font = 'bold 16px system-ui';
+
+      Object.values(state.players)
+        .sort((a, b) => b.score - a.score)
+        .forEach((player, index) => {
+          ctx.fillStyle = player.color;
+
+          ctx.fillText(
+            player.name + ': ' + player.score,
+            12,
+            24 + index * 22
+          );
+        });
+    }
+
+    function drawTimer() {
+      ctx.textAlign = 'right';
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 24px system-ui';
+
+      ctx.fillText(
+        '⏱ ' + Math.ceil(state.time),
+        W - 14,
+        30
+      );
+    }
+
+    function drawWinner() {
+      if (state.phase !== 'over') return;
+
+      ctx.fillStyle = 'rgba(0,0,0,0.6)';
+      ctx.fillRect(0, H / 2 - 50, W, 100);
+
+      ctx.fillStyle = '#ffd24a';
+      ctx.textAlign = 'center';
+      ctx.font = 'bold 32px system-ui';
+
+      ctx.fillText(
+        state.msg,
+        W / 2,
+        H / 2 + 10
+      );
+    }
+
+    function startRendering() {
+      if (renderFrame !== null) return;
+
+      function loop() {
+        render();
+        renderFrame = requestAnimationFrame(loop);
+      }
+
+      renderFrame = requestAnimationFrame(loop);
+    }
+
+    // --------------------------------------------------
+    // 12. BUTTON EVENTS AND INITIALIZATION
+    // --------------------------------------------------
+
+    hostBtn.addEventListener('click', hostGame);
+    joinBtn.addEventListener('click', joinGame);
+
+    codeInput.addEventListener('input', () => {
+      codeInput.value = codeInput.value
+        .toUpperCase()
+        .replace(/[^A-HJ-NP-Z]/g, '')
+        .slice(0, 4);
+    });
+
+    render();
+  </script>
+</body>
+</html>
